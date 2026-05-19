@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package godotnet.control;
+
+option go_package = "github.com/jordanstites/godotnet/controlpb;controlpb";
+
+// Vendored from github.com/jordanstites/godotnet at controlpb/control.proto.
+// Keep in lockstep with the upstream repo — see COMPATIBILITY.md.
+// The plugin does NOT use godobuf for these messages; it ships a hand-
+// rolled encoder/decoder in control_codec.gd. This file is preserved
+// only for reference and so users can regenerate if they wish.
+
+// ---- Handshake / keepalive messages ----------------------------------
+
+message Login {
+  bytes credentials = 1;
+}
+
+message LoginResponse {
+  bool   ok            = 1;
+  string error_message = 2;
+  uint32 player_id     = 3;
+  string session_token = 4;
+  string udp_endpoint  = 5;
+}
+
+message UdpHandshake {
+  uint32 player_id     = 1;
+  string session_token = 2;
+}
+
+message UdpHandshakeAck {
+  bool   ok        = 1;
+  uint32 player_id = 2;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+// ---- Wire-level wrappers --------------------------------------------
+
+message ClientFrame {
+  oneof body {
+    Login login = 1;
+    UdpHandshake udp_handshake = 2;
+    Pong pong = 3;
+    bytes game_payload = 16;
+  }
+}
+
+message ServerFrame {
+  oneof body {
+    LoginResponse login_response = 1;
+    UdpHandshakeAck udp_handshake_ack = 2;
+    Ping ping = 3;
+    bytes game_payload = 16;
+  }
+}
