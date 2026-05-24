@@ -20,7 +20,7 @@ does **not** require godobuf — its control-plane messages are encoded in
 
 For a complete working setup (Godot project + paired Go server +
 demos of every communication style), see the
-[godotnet-demos](../godotnet-demos) sibling repo.
+[godotnet-demos](https://github.com/jordanstites/godotnet-demos) sibling repo.
 
 ## Quick start
 
