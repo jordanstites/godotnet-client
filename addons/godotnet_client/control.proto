@@ -2,13 +2,7 @@ syntax = "proto3";
 
 package godotnet.control;
 
-option go_package = "github.com/jordanstites/godotnet/controlpb;controlpb";
-
-// Vendored from github.com/jordanstites/godotnet at controlpb/control.proto.
-// Keep in lockstep with the upstream repo — see COMPATIBILITY.md.
-// The plugin does NOT use godobuf for these messages; it ships a hand-
-// rolled encoder/decoder in control_codec.gd. This file is preserved
-// only for reference and so users can regenerate if they wish.
+option go_package = "github.com/jordanstites/godotnet/internal/proto;controlpb";
 
 // ---- Handshake / keepalive messages ----------------------------------
 
@@ -42,22 +36,58 @@ message Pong {
   uint64 nonce = 1;
 }
 
+// ---- RPC plane ------------------------------------------------------
+
+// RpcRequest carries one client→server request. The library matches the
+// inbound RpcResponse on the client side by correlation_id. Payload is
+// the marshaled bytes of Config.RPCRequestPrototype with a single oneof
+// body populated; the library extracts that body and dispatches by its
+// protobuf full-name (same pattern as ClientMessage).
+message RpcRequest {
+  uint64 correlation_id = 1;
+  bytes payload = 2;
+}
+
+// RpcResponse carries the server's reply for one RpcRequest. ok=false
+// means the handler returned an error (error_message is its .Error()),
+// a panic was recovered, or no handler was registered for the request
+// type. ok=true means payload contains the marshaled bare response
+// message — the client decodes it using the response type associated
+// with the request type it sent (the schema-level pairing is not
+// carried on the wire).
+message RpcResponse {
+  uint64 correlation_id = 1;
+  bool ok = 2;
+  string error_message = 3;
+  bytes payload = 4;
+}
+
 // ---- Wire-level wrappers --------------------------------------------
 
+// ClientFrame is the wire-level wrapper for every message sent from
+// client to server, over both TCP and UDP. The Godot client constructs
+// this and the library unmarshals it on receive.
 message ClientFrame {
   oneof body {
     Login login = 1;
     UdpHandshake udp_handshake = 2;
     Pong pong = 3;
+    // game_payload is the marshaled user-defined top-level
+    // ClientMessage. The library does not parse it itself; it is
+    // unmarshaled into Config.ClientMessagePrototype and dispatched.
     bytes game_payload = 16;
+    RpcRequest rpc_request = 17;
   }
 }
 
+// ServerFrame is the wire-level wrapper for every message sent from
+// server to client.
 message ServerFrame {
   oneof body {
     LoginResponse login_response = 1;
     UdpHandshakeAck udp_handshake_ack = 2;
     Ping ping = 3;
     bytes game_payload = 16;
+    RpcResponse rpc_response = 17;
   }
 }

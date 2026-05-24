@@ -40,6 +40,19 @@ static func encode_game_payload(payload: PackedByteArray) -> PackedByteArray:
 	_append_len_delim(out, payload)
 	return out
 
+# encode_rpc_request wraps the user's marshaled RpcRequest payload (the
+# bytes of their top-level RpcRequest message, with the matching oneof
+# body populated) in an RpcRequest{correlation_id, payload} envelope
+# and then in a ClientFrame{rpc_request=...}. Field 17, wire type 2.
+static func encode_rpc_request(correlation_id: int, payload: PackedByteArray) -> PackedByteArray:
+	var body := PackedByteArray()
+	_append_tag(body, 1, WIRE_VARINT)
+	_append_varint(body, correlation_id)
+	if not payload.is_empty():
+		_append_tag(body, 2, WIRE_LEN_DELIM)
+		_append_len_delim(body, payload)
+	return _wrap_client_frame(17, body)
+
 static func _wrap_client_frame(field: int, inner: PackedByteArray) -> PackedByteArray:
 	var out := PackedByteArray()
 	_append_tag(out, field, WIRE_LEN_DELIM)
@@ -55,6 +68,8 @@ static func _wrap_client_frame(field: int, inner: PackedByteArray) -> PackedByte
 #   {"kind": "udp_handshake_ack", "ok": bool, "player_id": int}
 #   {"kind": "ping", "nonce": int}
 #   {"kind": "game_payload", "payload": PackedByteArray}
+#   {"kind": "rpc_response", "correlation_id": int, "ok": bool,
+#    "error_message": String, "payload": PackedByteArray}
 #   {"kind": "unknown"}             # oneof unset or unknown field
 #   {"kind": "error", "reason": String}
 static func decode_server_frame(data: PackedByteArray) -> Dictionary:
@@ -101,6 +116,14 @@ static func decode_server_frame(data: PackedByteArray) -> Dictionary:
 					return {"kind": "error", "reason": "truncated game_payload"}
 				result = {"kind": "game_payload", "payload": ld4[0]}
 				i = ld4[1]
+			17: # RpcResponse, wire 2
+				if wire != WIRE_LEN_DELIM:
+					return {"kind": "error", "reason": "bad wire on field 17"}
+				var ld5 := _read_len_delim(data, i)
+				if ld5[1] < 0:
+					return {"kind": "error", "reason": "truncated rpc_response"}
+				result = _decode_rpc_response(ld5[0])
+				i = ld5[1]
 			_:
 				# Unknown field — skip per protobuf rules.
 				var ni := _skip_field(data, i, wire)
@@ -184,6 +207,50 @@ static func _decode_udp_handshake_ack(data: PackedByteArray) -> Dictionary:
 			_:
 				var ni := _skip_field(data, i, wire)
 				if ni < 0: return {"kind": "error", "reason": "trunc ack.unknown"}
+				i = ni
+	return out
+
+static func _decode_rpc_response(data: PackedByteArray) -> Dictionary:
+	var out := {
+		"kind": "rpc_response",
+		"correlation_id": 0,
+		"ok": false,
+		"error_message": "",
+		"payload": PackedByteArray(),
+	}
+	var i := 0
+	while i < data.size():
+		var tag_res := _read_varint(data, i)
+		if tag_res[1] < 0:
+			return {"kind": "error", "reason": "truncated rpc_response tag"}
+		var tag: int = tag_res[0]
+		i = tag_res[1]
+		var field := tag >> 3
+		var wire := tag & 0x07
+		match field:
+			1:
+				var v := _read_varint(data, i)
+				if v[1] < 0: return {"kind": "error", "reason": "trunc rpc.cid"}
+				out["correlation_id"] = v[0]
+				i = v[1]
+			2:
+				var v2 := _read_varint(data, i)
+				if v2[1] < 0: return {"kind": "error", "reason": "trunc rpc.ok"}
+				out["ok"] = v2[0] != 0
+				i = v2[1]
+			3:
+				var s := _read_len_delim(data, i)
+				if s[1] < 0: return {"kind": "error", "reason": "trunc rpc.err"}
+				out["error_message"] = (s[0] as PackedByteArray).get_string_from_utf8()
+				i = s[1]
+			4:
+				var p := _read_len_delim(data, i)
+				if p[1] < 0: return {"kind": "error", "reason": "trunc rpc.payload"}
+				out["payload"] = p[0]
+				i = p[1]
+			_:
+				var ni := _skip_field(data, i, wire)
+				if ni < 0: return {"kind": "error", "reason": "trunc rpc.unknown"}
 				i = ni
 	return out
 

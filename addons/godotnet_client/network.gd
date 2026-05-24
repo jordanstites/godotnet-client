@@ -7,6 +7,7 @@ extends Node
 #   disconnect_from_server()
 #   send_reliable(payload_bytes) -> bool   # TCP
 #   send_unreliable(payload_bytes) -> bool # UDP
+#   rpc_call(request_bytes, timeout_sec=10.0) -> Dictionary (await it)
 #   set_auto_reconnect(enabled, initial_delay=1.0, max_delay=30.0, max_attempts=-1)
 #   get_state() / is_ready() / get_player_id()
 #
@@ -36,6 +37,21 @@ enum DisconnectCode {
 	UDP_HANDSHAKE_TIMEOUT,
 	PROTOCOL_ERROR,
 }
+
+# RpcErrorCode classifies the failure mode of a non-ok rpc_call result
+# so UI code can branch without parsing error_message.
+enum RpcErrorCode {
+	NONE,             # ok==true; ignore other error fields
+	NOT_CONNECTED,    # called rpc_call while not in READY state
+	SERVER_ERROR,     # handler returned an error or refused the request
+	TIMEOUT,          # no response within the given deadline
+	DISCONNECTED,     # connection dropped while the call was in flight
+}
+
+# Internal awaiter for a single in-flight RPC. One instance per call;
+# the resolved signal fires exactly once with the result dictionary.
+class _RpcCall extends RefCounted:
+	signal resolved(result: Dictionary)
 
 signal connected(player_id: int)
 signal disconnected(code: int, reason: String)
@@ -78,6 +94,13 @@ var _reconnect_max_delay: float = 30.0
 var _reconnect_max_attempts: int = -1
 var _reconnect_attempt: int = 0
 var _reconnect_at_msec: int = -1
+
+# RPC state. _pending_rpcs is keyed by correlation_id; values are
+# {"call": _RpcCall, "deadline_msec": int}. _next_rpc_id never reuses
+# IDs within a single connection lifetime; a late response with a
+# stale ID is dropped silently.
+var _pending_rpcs: Dictionary = {}
+var _next_rpc_id: int = 1
 
 # ---- Public API ----------------------------------------------------
 
@@ -128,6 +151,49 @@ func send_unreliable(payload_bytes: PackedByteArray) -> bool:
 	_udp.put_packet(ControlCodec.encode_game_payload(payload_bytes))
 	return true
 
+# rpc_call sends an RPC request over TCP and awaits the matching server
+# response. Returns a Dictionary:
+#   {"ok": bool, "payload": PackedByteArray, "error_message": String,
+#    "error_code": int (RpcErrorCode), "timed_out": bool}
+# On ok=true, payload is the bare marshaled response message — decode
+# it using the response type paired with your request type at the
+# schema level. On ok=false, inspect error_code to branch.
+#
+# request_bytes is the marshaled top-level RpcRequest message (the one
+# your game.proto defines with a oneof over every request type). The
+# server uses the populated oneof body to dispatch.
+#
+# This function is `await`-able. Multiple concurrent rpc_call awaiters
+# are supported — responses are matched by correlation_id.
+func rpc_call(request_bytes: PackedByteArray, timeout_sec: float = 10.0) -> Dictionary:
+	if _state != State.READY:
+		return {
+			"ok": false,
+			"payload": PackedByteArray(),
+			"error_message": "not connected",
+			"error_code": RpcErrorCode.NOT_CONNECTED,
+			"timed_out": false,
+		}
+	var cid := _next_rpc_id
+	_next_rpc_id += 1
+	var call := _RpcCall.new()
+	_pending_rpcs[cid] = {
+		"call": call,
+		"deadline_msec": Time.get_ticks_msec() + int(max(0.0, timeout_sec) * 1000.0),
+	}
+	_send_tcp_frame(ControlCodec.encode_rpc_request(cid, request_bytes))
+	# _send_tcp_frame may have torn us down on write failure; resolve
+	# eagerly in that case so the awaiter doesn't hang.
+	if _state == State.DISCONNECTED:
+		_resolve_pending_rpc(cid, {
+			"ok": false,
+			"payload": PackedByteArray(),
+			"error_message": "tcp write failed during rpc_call",
+			"error_code": RpcErrorCode.DISCONNECTED,
+			"timed_out": false,
+		})
+	return await call.resolved
+
 func set_auto_reconnect(enabled: bool, initial_delay: float = 1.0,
 		max_delay: float = 30.0, max_attempts: int = -1) -> void:
 	_auto_reconnect = enabled
@@ -163,6 +229,9 @@ func _process(_delta: float) -> void:
 
 	if _udp != null:
 		_pump_udp()
+
+	# RPC timeouts — sweep once per frame.
+	_sweep_rpc_timeouts()
 
 	# UDP handshake resend / timeout.
 	if _state == State.HANDSHAKING_UDP:
@@ -284,6 +353,8 @@ func _handle_server_frame(frame: PackedByteArray, reliable: bool) -> void:
 				_udp.put_packet(ControlCodec.encode_pong(int(msg.get("nonce", 0))))
 		"game_payload":
 			server_message.emit(msg.get("payload", PackedByteArray()), reliable)
+		"rpc_response":
+			_on_rpc_response(msg)
 		"error":
 			push_warning("[GodotNet] frame decode error: %s" % msg.get("reason", "?"))
 		_:
@@ -320,6 +391,68 @@ func _on_login_response(msg: Dictionary) -> void:
 	_set_state(State.HANDSHAKING_UDP)
 	_bind_udp_and_handshake()
 
+func _on_rpc_response(msg: Dictionary) -> void:
+	var cid := int(msg.get("correlation_id", 0))
+	if cid == 0 or not _pending_rpcs.has(cid):
+		# Late response after timeout, or correlation_id 0 — drop.
+		return
+	var ok := bool(msg.get("ok", false))
+	var result := {
+		"ok": ok,
+		"payload": msg.get("payload", PackedByteArray()) if ok else PackedByteArray(),
+		"error_message": "" if ok else String(msg.get("error_message", "")),
+		"error_code": RpcErrorCode.NONE if ok else RpcErrorCode.SERVER_ERROR,
+		"timed_out": false,
+	}
+	_resolve_pending_rpc(cid, result)
+
+# _resolve_pending_rpc emits the awaiter's resolved signal and removes
+# the entry. Safe to call with an already-removed cid (no-op).
+func _resolve_pending_rpc(cid: int, result: Dictionary) -> void:
+	if not _pending_rpcs.has(cid):
+		return
+	var entry: Dictionary = _pending_rpcs[cid]
+	_pending_rpcs.erase(cid)
+	var call: _RpcCall = entry["call"]
+	call.resolved.emit(result)
+
+# _sweep_rpc_timeouts resolves any pending RPC whose deadline has
+# passed. Called from _process. Cheap linear scan — moderate volumes
+# only; if you ever have thousands of in-flight RPCs, this becomes a
+# hot loop and wants a priority queue.
+func _sweep_rpc_timeouts() -> void:
+	if _pending_rpcs.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	var expired: Array[int] = []
+	for cid in _pending_rpcs.keys():
+		var entry: Dictionary = _pending_rpcs[cid]
+		if now >= int(entry["deadline_msec"]):
+			expired.append(cid)
+	for cid in expired:
+		_resolve_pending_rpc(cid, {
+			"ok": false,
+			"payload": PackedByteArray(),
+			"error_message": "rpc timeout",
+			"error_code": RpcErrorCode.TIMEOUT,
+			"timed_out": true,
+		})
+
+# _cancel_all_pending_rpcs is called on disconnect. Every in-flight
+# awaiter gets a DISCONNECTED result so callers never hang.
+func _cancel_all_pending_rpcs(reason: String) -> void:
+	if _pending_rpcs.is_empty():
+		return
+	var cids: Array = _pending_rpcs.keys()
+	for cid in cids:
+		_resolve_pending_rpc(cid, {
+			"ok": false,
+			"payload": PackedByteArray(),
+			"error_message": reason,
+			"error_code": RpcErrorCode.DISCONNECTED,
+			"timed_out": false,
+		})
+
 func _on_udp_handshake_ack(msg: Dictionary) -> void:
 	if _state != State.HANDSHAKING_UDP:
 		return
@@ -350,6 +483,11 @@ func _transition_disconnected(code: int, reason: String) -> void:
 		_udp = null
 	_tcp_rx_buf.clear()
 	_udp_handshake_attempts = 0
+
+	# Fail every in-flight RPC so awaiters don't hang past disconnect.
+	# Done before emitting `disconnected` so user handlers see a
+	# consistent state if they inspect _pending_rpcs.
+	_cancel_all_pending_rpcs("disconnected: %s" % reason)
 
 	_set_state(State.DISCONNECTED)
 	disconnected.emit(code, reason)

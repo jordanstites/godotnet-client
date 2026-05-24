@@ -13,10 +13,14 @@ game scripts just send and receive marshaled bytes.
 2. Project → Project Settings → Plugins → enable **godotnet_client**.
 3. A `GodotNet` autoload singleton is now available globally.
 
-You will also need [godobuf](https://github.com/oniksan/godobuf) to generate
-GDScript classes from your own `game.proto`. The plugin does **not** require
-godobuf for its own control-plane messages — those are encoded in
+For game-plane messages you'll want [godobuf](https://github.com/oniksan/godobuf)
+to generate GDScript classes from your own `game.proto`. The plugin itself
+does **not** require godobuf — its control-plane messages are encoded in
 `control_codec.gd` directly.
+
+For a complete working setup (Godot project + paired Go server +
+demos of every communication style), see the
+[godotnet-demos](../godotnet-demos) sibling repo.
 
 ## Quick start
 

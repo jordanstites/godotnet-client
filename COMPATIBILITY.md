@@ -15,6 +15,17 @@ matching change in `control_codec.gd` and a new release of this plugin.
 | godotnet-client | godotnet server | control.proto pinned at |
 |---|---|---|
 | 0.1.0 | 0.1.x | [`c03b7a4`](https://github.com/jordanstites/godotnet/blob/c03b7a4767d1bc94b4e351727162dbd638c69f87/controlpb/control.proto) |
+| 0.2.0 | 0.2.x | unreleased — adds `RpcRequest` / `RpcResponse` messages and `rpc_request` (field 17) / `rpc_response` (field 17) oneof variants on `ClientFrame` / `ServerFrame` |
+
+### 0.2.0 — RPC plane
+
+Wire-additive change. The new fields use oneof tag 17 in both
+directions and do not collide with existing tags (game_payload is 16,
+control plane is 1–3). A 0.1.0 client talking to a 0.2.x server still
+works for non-RPC traffic — unknown oneof variants are tolerated by
+both sides per protobuf rules — but `rpc_call` on the client and
+`HandleRPC` on the server require the matching pair to actually do
+anything useful.
 
 ## How drift gets caught
 
